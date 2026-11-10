@@ -1,0 +1,11 @@
+# OpenPGP implementation. PGPy13 is the maintained fork of PGPy for Python 3.13+:
+# upstream PGPy 0.6.0 imports the `imghdr` module, which Python 3.13 removed.
+# It installs the same `pgpy` package, so the code is identical either way.
+PGPy13==0.6.1rc1
+
+# PGPy still uses cipher modes that `cryptography` is deprecating; this upper
+# bound is the newest release the test suite has been run against.
+cryptography>=42,<51
+
+# Qt GUI. "Essentials" = core Qt modules only (about half the size of full PySide6).
+PySide6-Essentials>=6.5

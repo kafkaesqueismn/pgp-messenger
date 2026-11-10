@@ -1,0 +1,24 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python build/cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Keys: never commit key material. The app stores keys in
+# ~/.config/pgp-messenger, but guard against exported/backup copies here too.
+*.asc
+*.gpg
+*.pgp
+*.key
+*.pub
+contacts.json
+private_key*
+public_key*
+keys/
