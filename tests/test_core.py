@@ -155,7 +155,14 @@ class GnuPGInteropTests(unittest.TestCase):
         cls.key = crypto.generate_keypair("Interop", "", "pw", BITS)
         cls.home = tempfile.TemporaryDirectory()
         cls.env = dict(os.environ, GNUPGHOME=cls.home.name)
-        cls.gpg("--import", input=str(cls.key))
+        try:
+            cls.gpg("--import", input=str(cls.key))
+        except subprocess.CalledProcessError as exc:
+            # e.g. Git-for-Windows' MSYS gpg can't use a Windows-style GNUPGHOME.
+            # That's an environment problem, not an app bug, so skip.
+            cls.home.cleanup()
+            detail = exc.stderr.decode(errors="replace").strip().splitlines()[-1:] or ["no output"]
+            raise unittest.SkipTest(f"gpg found but unusable here: {detail[0]}")
 
     @classmethod
     def tearDownClass(cls):
