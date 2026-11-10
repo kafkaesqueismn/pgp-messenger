@@ -2,14 +2,14 @@
 
 [![tests](https://github.com/kafkaesqueismn/pgp-messenger/actions/workflows/tests.yml/badge.svg)](https://github.com/kafkaesqueismn/pgp-messenger/actions/workflows/tests.yml)
 
-A small, friendly desktop app for **encrypting, decrypting, signing and verifying text messages**
-with OpenPGP. It works with GnuPG, Thunderbird, Kleopatra, ProtonMail and other OpenPGP tools.
+A small, friendly desktop app for **encrypting, decrypting, signing and verifying text messages and
+files** with OpenPGP. It works with GnuPG, Thunderbird, Kleopatra, ProtonMail and other OpenPGP tools.
 It covers the common tasks and skips the rest.
 
 - Real OpenPGP via [PGPy](https://github.com/SecurityInnovation/PGPy) (which uses the `cryptography` library).
   No hand-rolled crypto.
 - GUI built with PySide6 (Qt 6).
-- Text messages only, not files.
+- Text messages *and* files: photos, PDFs, anything binary.
 
 ## Features
 
@@ -19,6 +19,7 @@ It covers the common tasks and skips the rest.
 | **Contacts** | A local keyring of other people's **public** keys, stored by a name you choose. Paste or load a `.asc` file; remove contacts. |
 | **Encrypt** | Pick a contact, type a message, get ASCII-armored output ready to paste anywhere. Optionally also encrypt to yourself and sign it. |
 | **Decrypt** | Paste a `-----BEGIN PGP MESSAGE-----` block, enter your passphrase, read the message. Any signature inside is checked against your contacts. |
+| **Files** | Encrypt any file (image, PDF, archive…) for a contact. The output is a signed, binary `.pgp` file saved next to the original or wherever you choose. Decrypt a `.pgp` file to restore the original, with the sender's signature checked. Asks before anything over 100 MB, shows a working indicator, and never overwrites a file without asking. |
 | **Sign & Verify** | Make a cleartext-signed message (still readable, but tamper-evident), or verify one somebody sent you. |
 
 ## Install
@@ -110,9 +111,45 @@ python -m unittest -v
 5. **Decrypt.** Paste what they send you into **Decrypt**, click *Decrypt*, and enter your passphrase.
    The banner tells you whether it was signed and by whom.
 
+### Files
+
+6. **Encrypt a file.** In **Files → Encrypt a file**, click *Browse…*, pick e.g. `photo.png`, choose the
+   contact, and click *Encrypt and sign file*. Enter your passphrase, which is needed because files are
+   always signed. You get `photo.png.pgp` next to the original. Use *Change…* to save it somewhere else.
+   Send the `.pgp` file however you like: email attachment, USB stick, cloud drive.
+7. **Decrypt a file.** In **Files → Decrypt a file**, pick the `.pgp` file and click *Decrypt file*.
+   `photo.png.pgp` is restored as `photo.png` in the same folder. If the file was renamed and doesn't
+   end in `.pgp`/`.gpg`/`.asc`, the sender's original filename (stored inside the encryption) is used.
+   The banner shows where it was saved and whose signature it carries.
+
+Large files:
+- Anything **over 100 MB** brings up a warning before any work starts. It shows the file size,
+  roughly how much RAM the job needs (about 8× the file size) next to how much is free right now,
+  and a rough time estimate. Choose *Yes* to go ahead or *Cancel* (the default) to stop. Nothing is
+  asked or written until you decide. This applies to decrypting too, which needs even more memory.
+- The hard limit is **1 GB**. Bigger files are refused straight away, before you type a passphrase.
+- While a file is being processed you see a moving bar and an elapsed-time counter
+  (*Encrypting holiday.mov (150 MB)… 12 s*). The Files tab's buttons are locked so you can't start a
+  second job, but the other tabs keep working. There's no percentage because PGPy doesn't report
+  progress, but the timer shows the app hasn't frozen.
+- Closing the window mid-job asks first. If you quit anyway, nothing is saved and no existing file is
+  touched, because files are only written after a job completes.
+
+Safety rules for files:
+- **Nothing is overwritten without asking.** If the target already exists you get a *Replace file?*
+  prompt (default *No*). The final write also refuses to replace a file that appeared in the meantime.
+- **A BAD signature means the file isn't saved** unless you explicitly click *Save* in the warning.
+- Picking the wrong file gives an error saying what it actually is (*a PGP public key*, *a signed PGP
+  file, but it isn't encrypted*, or *isn't a PGP-encrypted file*). The app checks the OpenPGP packet
+  header itself first, because PGPy alone mistakes about 5% of random files for PGP data.
+- The sender's stored filename is treated as untrusted. Folders (`../`), hidden names (`.bashrc`)
+  and control characters are stripped, and the file is only ever written next to the `.pgp` or where you chose.
+- Writes go to a temporary file first, then get renamed, so a crash never leaves a half-written file.
+  On Linux, saved files are readable only by you (`0600`).
+
 Signature results:
-- 🟩 **Good signature from Alice**: the message is from Alice's key and has not been altered.
-- 🟥 **BAD signature**: the text was changed after signing, or the signature is forged. Don't trust it.
+- 🟩 **Good signature from Alice**: the message or file is from Alice's key and has not been altered.
+- 🟥 **BAD signature**: the contents were changed after signing, or the signature is forged. Don't trust it.
 - 🟨 **Signed by an unknown key**: add the sender's public key to Contacts to check it.
 
 ## Where keys are stored
@@ -174,6 +211,11 @@ OpenPGP combines the two:
 - **The session key is new for every message** and thrown away afterwards. Two encryptions of the same text look completely different.
 - **Multiple recipients cost almost nothing.** The message body is encrypted once; only the small session key is wrapped again for each extra recipient. That's how *Also encrypt to me* works.
 - **Integrity**: the encrypted data includes a SHA-1 based "modification detection code" (MDC). A message that was changed in transit fails to decrypt instead of producing silently altered text.
+- **Files use exactly the same scheme.** Only the packaging differs. A message is wrapped in *ASCII armor*
+  (the `-----BEGIN PGP MESSAGE-----` base64 text), so it survives being pasted into email or chat.
+  A file is saved as raw binary OpenPGP packets. Armor would only make it ~33% bigger, and an
+  attachment doesn't need to be text. The data is marked as *binary* so no tool ever rewrites its line endings.
+  The original filename and timestamp travel *inside* the encrypted part, invisible to anyone else.
 - **Signing** runs in the other direction. The sender hashes the message (SHA-256/512) and transforms the hash with their **private** key. Anyone with the sender's **public** key can check that the hash matches. For sign+encrypt, the signature is made first and placed *inside* the encrypted envelope, so only the recipient sees who signed it.
 - **Your private key at rest**: the secret RSA numbers are themselves AES-256 encrypted, under a key derived from your passphrase with a salted, iterated hash (OpenPGP "S2K"). A stolen `private_key.asc` file is useless without the passphrase, but only if the passphrase is strong.
 - Your generated key is really two RSA keys: a **primary key** for signing and certifying, and an **encryption subkey**. This is standard OpenPGP practice and lets the two roles be managed separately.
@@ -187,7 +229,12 @@ OpenPGP combines the two:
 - PGPy's parser drops the signature from cleartext-signed messages containing non-ASCII text
   (é, £, emoji). `crypto.py` works around this by splitting the message text from the signature
   block itself before handing both to PGPy. Tests cover this, including against real GnuPG.
-- Python can't reliably wipe secrets from memory, so passphrases and decrypted text may linger in RAM while the app runs.
+- Files are processed **in memory**, because PGPy can't stream. Measured peak RAM is about 5.5× the
+  file size when encrypting and 7.5× when decrypting. A 100 MB file took ~10 s to encrypt and ~2 s to
+  decrypt on a desktop PC. Hence the warning over 100 MB and the hard limit at 1 GB (≈ 8 GB of RAM).
+  For bigger files, use GnuPG (`gpg --encrypt --sign`), which streams. Its output is compatible
+  with this app's.
+- Python can't reliably wipe secrets from memory, so passphrases and decrypted text or files may linger in RAM while the app runs.
 - PGPy implements RFC 4880 (OpenPGP v4). Newer RFC 9580 (v6) keys from very recent tools may not import.
 - This is a learning- and convenience-oriented tool, not an audited security product.
 
@@ -197,8 +244,11 @@ OpenPGP combines the two:
 pgp_messenger/
 ├── crypto.py    thin wrapper over PGPy: keygen, encrypt, decrypt, sign, verify, friendly errors
 ├── keyring.py   on-disk storage of your key + contacts
-├── gui.py       PySide6 window and the five tabs
+├── fileops.py   output file names and safe, no-overwrite writing for the Files tab
+├── gui.py       PySide6 window and the six tabs
 └── __main__.py  `python -m pgp_messenger`
-tests/test_core.py   round-trip tests (no GUI)
+tests/test_core.py    keys, messages, signatures, keyring (no GUI)
+tests/test_files.py   file encryption, size limits, filename safety, no-overwrite writes, GnuPG interop
+tests/test_gui.py     Files tab, offscreen: large-file warning, working state, overwrite and bad-signature prompts
 .github/workflows/tests.yml   CI: runs the tests on Linux + Windows, Python 3.11 and 3.14
 ```

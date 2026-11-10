@@ -15,6 +15,7 @@ import re
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 # PGPy emits a lot of noisy warnings (e.g. about deprecated ciphers it
 # *knows* about but we never use). Keep the console clean.
@@ -80,7 +81,7 @@ class SignatureStatus:
             return f"Signed by an unknown key ({ids}). Import the sender's public key to verify it."
         if self.valid:
             return f"Good signature from {self.signer_name}."
-        return f"BAD signature claiming to be from {self.signer_name}. The message may have been altered!"
+        return f"BAD signature claiming to be from {self.signer_name}. The contents may have been altered!"
 
 
 @dataclass
@@ -142,13 +143,16 @@ def parse_key(armored: str) -> PGPKey:
     text = armored.strip()
     if not text:
         raise CryptoError("No key provided.")
+    error = CryptoError(
+        "That doesn't look like a valid PGP key. It should start with "
+        "'-----BEGIN PGP PUBLIC KEY BLOCK-----'."
+    )
     try:
         key, _ = pgpy.PGPKey.from_blob(text)
     except Exception as exc:  # PGPy raises a mix of ValueError/PGPError/etc.
-        raise CryptoError(
-            "That doesn't look like a valid PGP key. It should start with "
-            "'-----BEGIN PGP PUBLIC KEY BLOCK-----'."
-        ) from exc
+        raise error from exc
+    if key.fingerprint is None:  # PGPy returns an empty key for some junk instead of raising
+        raise error
     return key
 
 
@@ -272,24 +276,20 @@ def _parse_message(armored: str) -> pgpy.PGPMessage:
         ) from exc
 
 
-def encrypt(
-    text: str,
+def _sign_and_encrypt(
+    message: pgpy.PGPMessage,
     recipients: list[PGPKey],
-    signer: PGPKey | None = None,
-    passphrase: str | None = None,
-) -> str:
-    """Encrypt `text` to every key in `recipients`; optionally sign it first.
+    signer: PGPKey | None,
+    passphrase: str | None,
+) -> pgpy.PGPMessage:
+    """Shared by text and file encryption: sign (optional), then encrypt.
 
     Hybrid encryption: we generate ONE random AES-256 session key, encrypt
     the message with it once, and then wrap that session key separately with
     each recipient's RSA public key. Any recipient can unwrap it.
     """
-    if not text:
-        raise CryptoError("Type a message to encrypt.")
     if not recipients:
         raise CryptoError("Choose at least one recipient.")
-
-    message = pgpy.PGPMessage.new(text)
 
     if signer is not None:
         try:
@@ -310,7 +310,48 @@ def encrypt(
                 ) from exc
     finally:
         del session_key
-    return str(message)
+    return message
+
+
+def _decrypt_and_check(
+    message: pgpy.PGPMessage,
+    private_key: PGPKey,
+    passphrase: str,
+    known_keys: dict[str, PGPKey] | None,
+    what: str,
+) -> tuple[pgpy.PGPMessage, SignatureStatus]:
+    """Shared by text and file decryption. `what` is "message" or "file"."""
+    if not (set(message.encrypters) & _key_ids(private_key)):
+        raise CryptoError(f"This {what} wasn't encrypted to your key, so you can't decrypt it.")
+    try:
+        with private_key.unlock(passphrase):
+            plain = private_key.decrypt(message)
+    except PGPDecryptionError as exc:
+        raise _unlock_error(exc) from exc
+    except PGPError as exc:
+        raise CryptoError(f"Decryption failed: {exc}") from exc
+    return plain, _check_signatures(plain, known_keys or {})
+
+
+# --------------------------------------------------------------------------
+# Text messages (ASCII armor)
+# --------------------------------------------------------------------------
+
+
+def encrypt(
+    text: str,
+    recipients: list[PGPKey],
+    signer: PGPKey | None = None,
+    passphrase: str | None = None,
+) -> str:
+    """Encrypt `text` to every key in `recipients`; optionally sign it first.
+
+    Returns ASCII armor (base64 text) so it can be pasted into email/chat.
+    """
+    if not text:
+        raise CryptoError("Type a message to encrypt.")
+    message = pgpy.PGPMessage.new(text, compression=CompressionAlgorithm.ZLIB)
+    return str(_sign_and_encrypt(message, recipients, signer, passphrase))
 
 
 def decrypt(
@@ -326,19 +367,157 @@ def decrypt(
         raise CryptoError(
             "This message isn't encrypted. If it's a signed message, use the Sign & Verify tab."
         )
-    if not (set(message.encrypters) & _key_ids(private_key)):
-        raise CryptoError("This message wasn't encrypted to your key, so you can't decrypt it.")
+    plain, status = _decrypt_and_check(message, private_key, passphrase, known_keys, "message")
+    return DecryptResult(text=_as_text(plain.message), signature=status)
+
+
+# --------------------------------------------------------------------------
+# Files (binary OpenPGP, no armor)
+# --------------------------------------------------------------------------
+
+# PGPy works on whole files in memory (no streaming). Measured peak RAM is
+# ~5.5x the file size when encrypting and ~7.5x when decrypting, so:
+LARGE_FILE_BYTES = 100 * 2**20  # above this, the GUI warns and asks before starting
+MAX_FILE_BYTES = 1024 * 2**20  # hard limit: ~8 GB of RAM needed at this size
+MEMORY_PER_FILE_BYTE = 8  # rough peak-RAM multiplier, for the warning text
+ENCRYPT_SECONDS_PER_MB = 0.12  # measured on a desktop; decrypting is several times faster
+
+
+@dataclass
+class DecryptedFile:
+    data: bytes
+    original_name: str  # filename stored by the sender (sanitized), "" if none
+    signature: SignatureStatus
+
+
+def check_file_size(path: str | Path, decrypting: bool = False) -> int:
+    """Return the file's size, or raise CryptoError if it's over the hard limit.
+
+    Encrypted files may be slightly bigger than the original (headers, or
+    armor), so decryption gets 25% slack.
+    """
+    path = Path(path)
+    limit = MAX_FILE_BYTES + (MAX_FILE_BYTES // 4 if decrypting else 0)
+    size = path.stat().st_size
+    if size > limit:
+        raise CryptoError(
+            f"{path.name} is {size / 2**20:,.0f} MB. Files up to {MAX_FILE_BYTES // 2**20:,} MB are "
+            "supported, because the whole file has to fit in memory several times over."
+        )
+    return size
+
+
+def encrypt_file(
+    path: str | Path,
+    recipients: list[PGPKey],
+    signer: PGPKey | None = None,
+    passphrase: str | None = None,
+) -> bytes:
+    """Sign and encrypt a file; returns raw binary OpenPGP data (.pgp).
+
+    Binary instead of armor: armor is base64, which makes output ~33% bigger
+    and is only needed for pasting into text. `format="b"` stops PGPy from
+    guessing "this looks like text" and altering line endings.
+    The file's base name and modification time go inside the encrypted
+    packet, so only recipients can see them.
+    """
+    path = Path(path)
+    if not path.is_file():  # PGPy would otherwise encrypt the path *string*
+        raise CryptoError(f"File not found: {path}")
+    check_file_size(path)
+    message = pgpy.PGPMessage.new(
+        str(path), file=True, format="b", compression=CompressionAlgorithm.ZLIB
+    )
+    return bytes(_sign_and_encrypt(message, recipients, signer, passphrase))
+
+
+def decrypt_file(
+    path: str | Path,
+    private_key: PGPKey,
+    passphrase: str,
+    known_keys: dict[str, PGPKey] | None = None,
+) -> DecryptedFile:
+    """Decrypt a .pgp file (binary, or armored .asc) and check its signature."""
+    path = Path(path)
+    if not path.is_file():
+        raise CryptoError(f"File not found: {path}")
+    check_file_size(path, decrypting=True)
+    blob = path.read_bytes()
+    message = _parse_encrypted_file(blob, path.name)
+
+    plain, status = _decrypt_and_check(message, private_key, passphrase, known_keys, "file")
+    payload = plain.message
+    data = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
+    return DecryptedFile(data=data, original_name=_safe_filename(plain.filename), signature=status)
+
+
+# RFC 4880 section 4.2: every packet header byte has bit 7 set. Bit 6 picks
+# the "new" format (tag in the low 6 bits) or "old" format (tag in bits 5-2).
+_SESSION_KEY_TAGS = {1, 3}  # public-key / passphrase encrypted session key
+
+
+def _packet_tag(first_byte: int) -> int | None:
+    if not first_byte & 0x80:
+        return None
+    return first_byte & 0x3F if first_byte & 0x40 else (first_byte >> 2) & 0x0F
+
+
+def _parse_encrypted_file(blob: bytes, name: str) -> pgpy.PGPMessage:
+    """Parse a .pgp file, with errors that say what the file really is.
+
+    PGPy's parser is lenient: ~5% of random files "parse" as some kind of
+    PGP message. So we check the framing first (no crypto involved), and
+    only name a specific PGP type when PGPy also fully agrees.
+    """
+    not_pgp = CryptoError(f"{name} isn't a PGP-encrypted file.")
+    head = blob[:64].lstrip()
+    if head.startswith(b"-----BEGIN PGP"):  # ASCII-armored (.asc)
+        match = _ARMOR_BEGIN_RE.search(blob.decode("ascii", errors="replace").replace("\r\n", "\n"))
+        block_type = match[1].strip() if match else ""
+        if block_type and not block_type.startswith("MESSAGE"):
+            what = _NOT_A_MESSAGE.get(block_type, (f"a PGP {block_type.lower()}", None))[0]
+            raise CryptoError(f"{name} contains {what}, not an encrypted file.")
+    elif not blob or _packet_tag(blob[0]) not in _SESSION_KEY_TAGS:
+        # Encrypted messages always start with a session key packet. Is it at
+        # least some other genuine PGP data? Only say so if PGPy fully agrees.
+        try:
+            key, _ = pgpy.PGPKey.from_blob(blob)
+            if key.fingerprint is not None:  # PGPy returns an empty key for junk
+                kind = "public" if key.is_public else "private"
+                raise CryptoError(f"{name} is a PGP {kind} key, not an encrypted file.")
+        except CryptoError:
+            raise
+        except Exception:
+            pass
+        try:
+            message = pgpy.PGPMessage.from_blob(blob)
+            if message.signatures and not message.is_encrypted and message.message is not None:
+                raise CryptoError(f"{name} is a signed PGP file, but it isn't encrypted.")
+        except CryptoError:
+            raise
+        except Exception:
+            pass
+        raise not_pgp
 
     try:
-        with private_key.unlock(passphrase):
-            plain = private_key.decrypt(message)
-    except PGPDecryptionError as exc:
-        raise _unlock_error(exc) from exc
-    except PGPError as exc:
-        raise CryptoError(f"Decryption failed: {exc}") from exc
+        message = pgpy.PGPMessage.from_blob(blob)
+        encrypted = message.is_encrypted and bool(message.encrypters)
+    except Exception as exc:
+        raise not_pgp from exc
+    if not encrypted:
+        raise not_pgp
+    return message
 
-    status = _check_signatures(plain, known_keys or {})
-    return DecryptResult(text=_as_text(plain.message), signature=status)
+
+def _safe_filename(name: str | None) -> str:
+    """The stored filename comes from the sender: never trust it as a path."""
+    if not name or name == "_CONSOLE":
+        return ""
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]  # drop any directory part
+    name = "".join(ch for ch in name if ch.isprintable()).strip()
+    if not name or name.startswith("."):  # no hidden files / "." / ".."
+        return ""
+    return name[:255]
 
 
 def sign(text: str, private_key: PGPKey, passphrase: str) -> str:

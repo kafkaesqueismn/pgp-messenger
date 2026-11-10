@@ -136,6 +136,9 @@ class CryptoTests(unittest.TestCase):
             crypto.decrypt("hello", self.bob, "bob-pass")
         with self.assertRaises(CryptoError):
             crypto.parse_key("not a key")
+        with mock.patch.object(crypto.pgpy.PGPKey, "from_blob", return_value=(crypto.pgpy.PGPKey(), {})):
+            with self.assertRaisesRegex(CryptoError, "valid PGP key"):  # PGPy's "empty key" for junk
+                crypto.parse_key("-----BEGIN PGP PUBLIC KEY BLOCK-----\n...")
 
     def test_wrong_tab_hints(self):
         signed = crypto.sign("plain", self.alice, "alice-pass")

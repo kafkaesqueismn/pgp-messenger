@@ -1,7 +1,7 @@
 """PySide6 user interface.
 
-Five tabs, each a small self-contained widget:
-    My Key | Contacts | Encrypt | Decrypt | Sign & Verify
+Six tabs, each a small self-contained widget:
+    My Key | Contacts | Encrypt | Decrypt | Files | Sign & Verify
 
 All crypto goes through `crypto.py`; all storage through `keyring.py`.
 Passphrases are asked for at the moment they're needed and never stored.
@@ -9,9 +9,10 @@ Passphrases are asked for at the moment they're needed and never stored.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtCore import QElapsedTimer, QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QFontDatabase, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -36,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import crypto
+from . import crypto, fileops
 from .crypto import CryptoError
 from .keyring import Keyring
 
@@ -120,6 +122,37 @@ def ask_passphrase(parent: QWidget, why: str) -> str | None:
     return text if ok else None
 
 
+def fill_contacts_combo(combo: QComboBox, keyring: Keyring) -> None:
+    """Fill a 'To:' dropdown with contact names, keeping the current choice."""
+    current = combo.currentText()
+    combo.clear()
+    names = keyring.contact_names()
+    if names:
+        combo.addItems(names)
+        if current in names:
+            combo.setCurrentText(current)
+    else:
+        combo.addItem("(no contacts: add one in Contacts)")
+    combo.setEnabled(bool(names))
+
+
+def human_size(n: int) -> str:
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024
+    return ""
+
+
+def estimate_duration(size: int) -> str:
+    """Rough encryption time as words, e.g. 'around 20 seconds'."""
+    seconds = size / 2**20 * crypto.ENCRYPT_SECONDS_PER_MB
+    if seconds < 60:
+        return f"around {max(5, round(seconds / 5) * 5)} seconds"
+    minutes = round(seconds / 60)
+    return "around a minute" if minutes <= 1 else f"around {minutes} minutes"
+
+
 class _TaskSignals(QObject):
     done = Signal(object)
     failed = Signal(object)
@@ -135,11 +168,57 @@ class BackgroundTask(QRunnable):
 
     def run(self):
         try:
-            result = self.fn()
-        except Exception as exc:  # noqa: BLE001 - reported to the user
-            self.signals.failed.emit(exc)
-        else:
-            self.signals.done.emit(result)
+            try:
+                result = self.fn()
+            except Exception as exc:  # noqa: BLE001 - reported to the user
+                self.signals.failed.emit(exc)
+            else:
+                self.signals.done.emit(result)
+        except RuntimeError:
+            pass  # window was closed mid-job; nobody is listening any more
+
+
+class BusyIndicator(QWidget):
+    """'Working…' state: animated bar + elapsed seconds.
+
+    PGPy offers no progress callbacks, so a percentage isn't possible. An
+    animated (indeterminate) bar plus a ticking timer still shows the app is
+    alive. The timer runs on the UI thread while the work runs on a worker.
+    """
+
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.label = QLabel()
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 0)  # min == max == 0 -> Qt's animated "busy" mode
+        self.bar.setTextVisible(False)
+        layout.addWidget(self.label)
+        layout.addWidget(self.bar)
+        self._text = ""
+        self._clock = QElapsedTimer()
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick)
+        self.setVisible(False)
+
+    def start(self, text: str) -> None:
+        self._text = text
+        self._clock.start()
+        self._tick()
+        self._timer.start()
+        self.setVisible(True)
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self.setVisible(False)
+
+    def elapsed_seconds(self) -> int:
+        return self._clock.elapsed() // 1000
+
+    def _tick(self) -> None:
+        self.label.setText(f"{self._text}  {self.elapsed_seconds()} s")
 
 
 # --------------------------------------------------------------------------
@@ -481,16 +560,7 @@ class EncryptTab(Tab):
         self.refresh()
 
     def refresh(self) -> None:
-        current = self.to_in.currentText()
-        self.to_in.clear()
-        names = self.keyring.contact_names()
-        if names:
-            self.to_in.addItems(names)
-            if current in names:
-                self.to_in.setCurrentText(current)
-        else:
-            self.to_in.addItem("(no contacts: add one in Contacts)")
-        self.to_in.setEnabled(bool(names))
+        fill_contacts_combo(self.to_in, self.keyring)
         has_key = self.keyring.has_identity()
         self.self_in.setEnabled(has_key)
         self.sign_in.setEnabled(has_key)
@@ -529,11 +599,17 @@ def _known_keys(keyring: Keyring) -> dict:
     return keys
 
 
-def _banner_for_signature(banner: StatusBanner, status: crypto.SignatureStatus, prefix: str = "") -> None:
-    kind = "ok" if status.valid else ("error" if status.signer_name else "warn")
+def _signature_kind(status: crypto.SignatureStatus) -> str:
+    """Banner colour for a signature result: green good, red bad, yellow unknown, blue unsigned."""
     if not status.signed:
-        kind = "info"
-    banner.show_message(kind, prefix + status.describe())
+        return "info"
+    if status.valid:
+        return "ok"
+    return "error" if status.signer_name else "warn"
+
+
+def _banner_for_signature(banner: StatusBanner, status: crypto.SignatureStatus, prefix: str = "") -> None:
+    banner.show_message(_signature_kind(status), prefix + status.describe())
 
 
 class DecryptTab(Tab):
@@ -579,6 +655,333 @@ class DecryptTab(Tab):
             return self.banner.show_message("error", str(exc))
         self.out.setPlainText(result.text)
         _banner_for_signature(self.banner, result.signature, "Decrypted. ")
+
+
+class FilesTab(Tab):
+    """Encrypt/decrypt whole files (images, PDFs, anything) as binary .pgp.
+
+    The crypto runs on a background thread so big files don't freeze the
+    window; dialogs (passphrase, "replace file?") always run on the UI thread.
+    """
+
+    def __init__(self, keyring: Keyring):
+        super().__init__(keyring)
+        self._task: BackgroundTask | None = None
+        self._on_done = None
+        self._task_banner: StatusBanner | None = None
+        self._task_indicator: BusyIndicator | None = None
+        self._controls: list[QWidget] = []  # locked while a job runs
+        self._dec_dst_custom = False
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            hint(
+                "Encrypt photos, documents or any other file for a contact. Files are always "
+                "<b>signed</b> by you, and saved as binary <code>.pgp</code> files that GnuPG and other "
+                f"OpenPGP tools can open too. Up to {crypto.MAX_FILE_BYTES // 2**20:,} MB; you'll be asked "
+                f"before anything over {crypto.LARGE_FILE_BYTES // 2**20} MB."
+            )
+        )
+
+        # ---- encrypt
+        enc_box = QGroupBox("Encrypt a file")
+        form = QFormLayout(enc_box)
+        self.enc_src = self._path_field("Choose a file to encrypt…")
+        form.addRow("File", self._with_button(self.enc_src, "Browse…", self._pick_enc_src))
+        to_row = QHBoxLayout()
+        self.enc_to = QComboBox()
+        self.enc_to.setMinimumWidth(220)
+        self.enc_self = QCheckBox("Also encrypt to me (so I can open it later)")
+        self.enc_self.setChecked(True)
+        to_row.addWidget(self.enc_to)
+        to_row.addWidget(self.enc_self)
+        to_row.addStretch()
+        form.addRow("To", to_row)
+        self.enc_dst = self._path_field("Saved next to the original as <name>.pgp")
+        form.addRow("Save as", self._with_button(self.enc_dst, "Change…", self._pick_enc_dst))
+        self.enc_btn = QPushButton("Encrypt and sign file")
+        self.enc_btn.clicked.connect(self._encrypt)
+        form.addRow(self.enc_btn)
+        self.enc_busy = BusyIndicator()
+        form.addRow(self.enc_busy)
+        self.enc_banner = StatusBanner()
+        form.addRow(self.enc_banner)
+        layout.addWidget(enc_box)
+
+        # ---- decrypt
+        dec_box = QGroupBox("Decrypt a file")
+        form = QFormLayout(dec_box)
+        self.dec_src = self._path_field("Choose a .pgp file you received…")
+        form.addRow("File", self._with_button(self.dec_src, "Browse…", self._pick_dec_src))
+        self.dec_dst = self._path_field("Restored next to the encrypted file")
+        form.addRow("Save as", self._with_button(self.dec_dst, "Change…", self._pick_dec_dst))
+        self.dec_btn = QPushButton("Decrypt file")
+        self.dec_btn.clicked.connect(self._decrypt)
+        form.addRow(self.dec_btn)
+        self.dec_busy = BusyIndicator()
+        form.addRow(self.dec_busy)
+        self.dec_banner = StatusBanner()
+        form.addRow(self.dec_banner)
+        layout.addWidget(dec_box)
+        layout.addStretch()
+        self._controls += [self.enc_to, self.enc_self, self.enc_btn, self.dec_btn]
+        self.refresh()
+
+    # ---------------------------------------------------------------- widgets
+
+    @staticmethod
+    def _path_field(placeholder: str) -> QLineEdit:
+        field = QLineEdit()
+        field.setReadOnly(True)  # paths only come from file dialogs: no typos
+        field.setPlaceholderText(placeholder)
+        return field
+
+    def _with_button(self, field: QLineEdit, label: str, slot) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.addWidget(field, stretch=1)
+        btn = QPushButton(label)
+        btn.clicked.connect(slot)
+        row.addWidget(btn)
+        self._controls.append(btn)
+        return row
+
+    def refresh(self) -> None:
+        fill_contacts_combo(self.enc_to, self.keyring)
+        if self.is_busy():
+            self.enc_to.setEnabled(False)
+
+    def is_busy(self) -> bool:
+        return self._task is not None
+
+    # ---------------------------------------------------------------- pickers
+    # DontConfirmOverwrite: we ask ourselves, right before writing, in one place.
+
+    def _start_dir(self, field: QLineEdit) -> str:
+        return str(Path(field.text()).parent) if field.text() else str(Path.home())
+
+    def _pick_enc_src(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a file to encrypt", self._start_dir(self.enc_src))
+        if path:
+            self.enc_src.setText(path)
+            self.enc_dst.setText(str(fileops.encrypted_path_for(Path(path))))
+            self.enc_banner.clear()
+
+    def _pick_enc_dst(self) -> None:
+        start = self.enc_dst.text() or str(Path.home())
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save encrypted file as", start, "PGP files (*.pgp);;All files (*)",
+            options=QFileDialog.Option.DontConfirmOverwrite,
+        )
+        if path:
+            self.enc_dst.setText(path)
+
+    def _pick_dec_src(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose an encrypted file", self._start_dir(self.dec_src),
+            "Encrypted files (*.pgp *.gpg *.asc);;All files (*)",
+        )
+        if path:
+            self.dec_src.setText(path)
+            self.dec_dst.setText(str(fileops.decrypted_path_for(Path(path))))
+            self._dec_dst_custom = False
+            self.dec_banner.clear()
+
+    def _pick_dec_dst(self) -> None:
+        start = self.dec_dst.text() or str(Path.home())
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save decrypted file as", start, options=QFileDialog.Option.DontConfirmOverwrite
+        )
+        if path:
+            self.dec_dst.setText(path)
+            self._dec_dst_custom = True
+
+    # ---------------------------------------------------------------- helpers
+
+    def _confirm_overwrite(self, dst: Path) -> bool | None:
+        """False: nothing to overwrite. True: user said replace. None: cancelled."""
+        if dst.is_dir():
+            raise CryptoError(f"{dst} is a folder. Choose a file name instead.")
+        if not dst.exists():
+            return False
+        answer = QMessageBox.question(
+            self, "Replace file?",
+            f"{dst.name} already exists in\n{dst.parent}\n\nReplace it?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return True if answer == QMessageBox.StandardButton.Yes else None
+
+    def _save(self, dst: Path, data: bytes, overwrite: bool, banner: StatusBanner) -> bool:
+        try:
+            fileops.write_file(dst, data, overwrite=overwrite)
+        except FileExistsError:
+            banner.show_message("error", f"Not saved: {dst.name} appeared while working. Nothing was overwritten. Try again.")
+            return False
+        except OSError as exc:
+            banner.show_message("error", f"Couldn't save {dst}: {exc.strerror or exc}")
+            return False
+        return True
+
+    def _run(self, fn, on_done, banner: StatusBanner, busy: BusyIndicator, busy_text: str) -> None:
+        for widget in self._controls:
+            widget.setEnabled(False)
+        banner.clear()
+        busy.start(busy_text)
+        self._on_done, self._task_banner, self._task_indicator = on_done, banner, busy
+        self._task = BackgroundTask(fn)
+        self._task.signals.done.connect(self._task_done)  # bound methods: delivered on UI thread
+        self._task.signals.failed.connect(self._task_failed)
+        QThreadPool.globalInstance().start(self._task)
+
+    def _finish(self) -> None:
+        self._task_indicator.stop()
+        for widget in self._controls:
+            widget.setEnabled(True)
+        self._task = None
+        self.refresh()  # re-applies "no contacts" disabled state
+
+    def _task_done(self, result) -> None:
+        self._finish()
+        self._on_done(result)
+
+    def _task_failed(self, exc) -> None:
+        self._finish()
+        if isinstance(exc, CryptoError):
+            msg = str(exc)
+        elif isinstance(exc, OSError):
+            msg = f"Couldn't read the file: {exc.strerror or exc}"
+        else:
+            msg = f"Unexpected error: {exc}"
+        self._task_banner.show_message("error", msg)
+
+    def _confirm_large_file(self, path: Path, decrypting: bool) -> bool:
+        """Hard limit -> CryptoError. Over LARGE_FILE_BYTES -> ask. Returns True to go ahead."""
+        size = crypto.check_file_size(path, decrypting=decrypting)
+        if size <= crypto.LARGE_FILE_BYTES:
+            return True
+        need = size * crypto.MEMORY_PER_FILE_BYTE
+        free = fileops.available_memory()
+        action = "Decrypting" if decrypting else "Encrypting"
+        lines = [
+            f"{path.name} is {human_size(size)}.",
+            "",
+            f"{action} it loads the whole file into memory, several times over: it needs roughly "
+            f"{human_size(need)} of free RAM"
+            + (f" (about {human_size(free)} is free right now)." if free is not None else "."),
+        ]
+        if not decrypting:
+            lines.append(f"It may take {estimate_duration(size)}, longer on a slower computer. "
+                         "The rest of the app stays usable meanwhile.")
+        if free is not None and need > free:
+            lines += ["", "⚠ That's more memory than is free. Your computer may slow to a crawl, "
+                          "or the app may be closed by the system."]
+        lines += ["", "Continue?"]
+        answer = QMessageBox.warning(
+            self, "Large file", "\n".join(lines),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    # ---------------------------------------------------------------- encrypt
+
+    def _encrypt(self) -> None:
+        banner = self.enc_banner
+        banner.clear()
+        if not self.enc_src.text():
+            return banner.show_message("error", "Choose a file to encrypt first.")
+        if not self.enc_to.isEnabled():
+            return banner.show_message("warn", "Add a contact first, in the Contacts tab.")
+        me = self.identity_or_warn(banner)  # files are always signed, so a key is required
+        if me is None:
+            return
+        src, dst = Path(self.enc_src.text()), Path(self.enc_dst.text())
+        name = self.enc_to.currentText()
+        try:
+            if dst.resolve() == src.resolve():
+                raise CryptoError("The encrypted file can't replace the original. Choose another name.")
+            if not self._confirm_large_file(src, decrypting=False):
+                return banner.show_message("info", "Cancelled. Nothing was encrypted.")
+            overwrite = self._confirm_overwrite(dst)
+            if overwrite is None:
+                return banner.show_message("warn", "Not saved. Choose another name with Change…")
+            recipients = [self.keyring.get_contact(name)] + ([me] if self.enc_self.isChecked() else [])
+        except (OSError, CryptoError) as exc:
+            return banner.show_message("error", str(exc))
+        passphrase = ask_passphrase(self, "Signing the file needs your private key.")
+        if passphrase is None:
+            return
+
+        def done(data: bytes) -> None:
+            if self._save(dst, data, overwrite, banner):
+                banner.show_message(
+                    "ok", f"Encrypted and signed {src.name} for {name}.\nSaved {human_size(len(data))} to {dst}"
+                )
+
+        self._run(
+            lambda: crypto.encrypt_file(src, recipients, me, passphrase),
+            done, banner, self.enc_busy, f"Encrypting {src.name} ({human_size(src.stat().st_size)})…",
+        )
+
+    # ---------------------------------------------------------------- decrypt
+
+    def _decrypt(self) -> None:
+        banner = self.dec_banner
+        banner.clear()
+        if not self.dec_src.text():
+            return banner.show_message("error", "Choose an encrypted file first.")
+        me = self.identity_or_warn(banner)
+        if me is None:
+            return
+        src = Path(self.dec_src.text())
+        try:
+            if not self._confirm_large_file(src, decrypting=True):
+                return banner.show_message("info", "Cancelled. Nothing was decrypted.")
+        except (OSError, CryptoError) as exc:
+            return banner.show_message("error", str(exc))
+        passphrase = ask_passphrase(self, "Decrypting needs your private key.")
+        if passphrase is None:
+            return
+        known = _known_keys(self.keyring)
+        self._run(
+            lambda: crypto.decrypt_file(src, me, passphrase, known),
+            lambda result: self._decrypted(src, result), banner, self.dec_busy,
+            f"Decrypting {src.name} ({human_size(src.stat().st_size)})…",
+        )
+
+    def _decrypted(self, src: Path, result: crypto.DecryptedFile) -> None:
+        banner, status = self.dec_banner, result.signature
+        if self._dec_dst_custom:
+            dst = Path(self.dec_dst.text())
+        else:  # now we know the sender's original name, use it if the .pgp name doesn't say
+            dst = fileops.decrypted_path_for(src, result.original_name)
+            self.dec_dst.setText(str(dst))
+
+        if status.signed and status.signer_name and not status.valid:
+            answer = QMessageBox.warning(
+                self, "Bad signature",
+                f"{status.describe()}\n\nSave the decrypted file anyway?",
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard,
+                QMessageBox.StandardButton.Discard,
+            )
+            if answer != QMessageBox.StandardButton.Save:
+                return banner.show_message("error", status.describe() + " The file was not saved.")
+        try:
+            if dst.resolve() == src.resolve():
+                raise CryptoError("Can't save over the encrypted file itself. Choose another name.")
+            overwrite = self._confirm_overwrite(dst)
+        except (OSError, CryptoError) as exc:
+            return banner.show_message("error", str(exc))
+        if overwrite is None:
+            return banner.show_message("warn", "Not saved. Choose another name with Change…, then decrypt again.")
+        if not self._save(dst, result.data, overwrite, banner):
+            return
+
+        lines = [f"Decrypted {src.name}. Saved {human_size(len(result.data))} to {dst}"]
+        if result.original_name and result.original_name != dst.name:
+            lines.append(f"Sender's original file name: {result.original_name}")
+        lines.append(status.describe())
+        banner.show_message(_signature_kind(status), "\n".join(lines))
 
 
 class SignVerifyTab(Tab):
@@ -662,15 +1065,30 @@ class MainWindow(QMainWindow):
             ContactsTab(keyring),
             EncryptTab(keyring),
             DecryptTab(keyring),
+            FilesTab(keyring),
             SignVerifyTab(keyring),
         ]
-        for page, title in zip(self.pages, ["My Key", "Contacts", "Encrypt", "Decrypt", "Sign && Verify"]):
+        for page, title in zip(self.pages, ["My Key", "Contacts", "Encrypt", "Decrypt", "Files", "Sign && Verify"]):
             page.keys_changed.connect(self.refresh_all)
             self.tabs.addTab(page, title)
         self.setCentralWidget(self.tabs)
         self.statusBar().showMessage(f"Keys stored in {keyring.root}")
         if not keyring.has_identity():
             self.tabs.setCurrentIndex(0)
+
+    def closeEvent(self, event) -> None:
+        if any(getattr(page, "is_busy", lambda: False)() for page in self.pages):
+            answer = QMessageBox.question(
+                self, "Still working",
+                "A file is still being encrypted or decrypted.\n\n"
+                "Quit anyway? Nothing will be saved, and no existing file is touched.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        event.accept()
 
     def refresh_all(self) -> None:
         for page in self.pages:
@@ -684,4 +1102,11 @@ def run() -> int:
     app.setApplicationName("PGP Messenger")
     window = MainWindow(Keyring())
     window.show()
-    return app.exec()
+    code = app.exec()
+    if QThreadPool.globalInstance().activeThreadCount():
+        # The user quit during a file job (and confirmed). Workers only compute
+        # in memory (all saving happens on the UI thread), so nothing is lost by
+        # not waiting. Otherwise Qt would keep an invisible process alive,
+        # holding gigabytes of RAM, until the job finished.
+        os._exit(code)
+    return code
