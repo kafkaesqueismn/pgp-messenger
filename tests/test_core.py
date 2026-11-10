@@ -10,11 +10,13 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pgpy
 
 from pgp_messenger import crypto
 from pgp_messenger.crypto import CryptoError
+from pgp_messenger import keyring as keyring_mod
 from pgp_messenger.keyring import Keyring
 
 BITS = 2048  # small keys keep the tests fast; the app offers 3072/4096
@@ -200,15 +202,30 @@ class KeyringTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_identity_persists_with_private_permissions(self):
+    def test_identity_persists(self):
         self.assertFalse(self.ring.has_identity())
         self.ring.save_identity(self.me)
-        mode = stat.S_IMODE(self.ring.identity_path.stat().st_mode)
-        self.assertEqual(mode, 0o600)
-        self.assertEqual(stat.S_IMODE(self.ring.root.stat().st_mode), 0o700)
         loaded = Keyring(self.ring.root).load_identity()
         self.assertEqual(loaded.fingerprint, self.me.fingerprint)
         self.assertTrue(loaded.is_protected)
+
+    @unittest.skipIf(os.name == "nt", "Windows uses per-user ACLs, not POSIX mode bits")
+    def test_files_are_owner_only(self):
+        self.ring.save_identity(self.me)
+        self.ring.add_contact("Alice", str(self.alice.pubkey))
+        for path in (self.ring.identity_path, self.ring.index_path, *self.ring.contacts_dir.iterdir()):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600, path)
+        for d in (self.ring.root, self.ring.contacts_dir):
+            self.assertEqual(stat.S_IMODE(d.stat().st_mode), 0o700, d)
+
+    def test_default_location_per_platform(self):
+        env = {"APPDATA": r"C:\Users\x\AppData\Roaming", "XDG_CONFIG_HOME": "/xdg"}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("PGP_MESSENGER_HOME", None)
+            self.assertEqual(keyring_mod.default_root("nt"), Path(env["APPDATA"]) / "pgp-messenger")
+            self.assertEqual(keyring_mod.default_root("posix"), Path("/xdg") / "pgp-messenger")
+        with mock.patch.dict(os.environ, {"PGP_MESSENGER_HOME": "/custom"}):
+            self.assertEqual(keyring_mod.default_root(), Path("/custom"))
 
     def test_contacts_add_list_remove(self):
         self.ring.add_contact("Alice", str(self.alice.pubkey))

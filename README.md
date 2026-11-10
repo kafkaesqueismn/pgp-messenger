@@ -1,5 +1,7 @@
 # PGP Messenger
 
+[![tests](https://github.com/kafkaesqueismn/pgp-messenger/actions/workflows/tests.yml/badge.svg)](https://github.com/kafkaesqueismn/pgp-messenger/actions/workflows/tests.yml)
+
 A small, friendly desktop app for **encrypting, decrypting, signing and verifying text messages**
 with OpenPGP. It works with GnuPG, Thunderbird, Kleopatra, ProtonMail and other OpenPGP tools.
 It covers the common tasks and skips the rest.
@@ -19,9 +21,14 @@ It covers the common tasks and skips the rest.
 | **Decrypt** | Paste a `-----BEGIN PGP MESSAGE-----` block, enter your passphrase, read the message. Any signature inside is checked against your contacts. |
 | **Sign & Verify** | Make a cleartext-signed message (still readable, but tamper-evident), or verify one somebody sent you. |
 
-## Install (Arch Linux)
+## Install
 
-You need Python 3.11+ (Arch's `python` package is fine). Pick one of the two setups.
+Works on **Linux** and **Windows** with Python 3.11 or newer. The test suite runs on both
+(see the badge above).
+
+### Linux (Arch)
+
+Arch's `python` package is fine. Pick one of the two setups.
 
 **Option A: reuse Arch's Qt (fast, recommended on Arch).** PySide6 is a large download from pip,
 so let pacman provide it:
@@ -47,10 +54,40 @@ pip install -r requirements.txt
 > removed in Python 3.13, so it crashes on import on current Arch. `PGPy13` is the maintained fork
 > with that fixed. It installs the same `pgpy` module, so nothing else changes.
 
+### Windows
+
+1. Install Python 3.11 or newer from [python.org](https://www.python.org/downloads/windows/).
+   In the installer, tick **"Add python.exe to PATH"**.
+2. Install [Git for Windows](https://git-scm.com/download/win), or download this repo as a ZIP
+   from GitHub (*Code → Download ZIP*) and unzip it.
+3. Open **PowerShell** and run:
+
+```powershell
+git clone https://github.com/kafkaesqueismn/pgp-messenger
+cd pgp-messenger
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+If PowerShell refuses to run `Activate.ps1` ("running scripts is disabled on this system"), allow
+local scripts for your user once with
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, or use **Command Prompt** (`cmd`) instead,
+where the activate command is `.venv\Scripts\activate.bat`.
+
+Everything comes from pip, including Qt, so there's nothing else to install. GnuPG is **not** needed.
+
 ## Run
 
+From the `pgp-messenger` folder, activate the venv, then start the app:
+
 ```bash
-source .venv/bin/activate
+source .venv/bin/activate          # Linux
+python -m pgp_messenger
+```
+
+```powershell
+.venv\Scripts\Activate.ps1         # Windows (PowerShell)
 python -m pgp_messenger
 ```
 
@@ -80,17 +117,34 @@ Signature results:
 
 ## Where keys are stored
 
+| OS | Location |
+|---|---|
+| Linux | `~/.config/pgp-messenger` (or `$XDG_CONFIG_HOME/pgp-messenger`) |
+| Windows | `%APPDATA%\pgp-messenger`, i.e. `C:\Users\<you>\AppData\Roaming\pgp-messenger` |
+
 ```
-~/.config/pgp-messenger/          (or $XDG_CONFIG_HOME/pgp-messenger)
+pgp-messenger/
 ├── private_key.asc               your keypair; secret parts encrypted with your passphrase
 ├── contacts.json                 name → fingerprint index
 └── contacts/<FINGERPRINT>.asc    one public key per contact
 ```
 
-- The directory is `0700` and every file is `0600`. Writes are atomic (temp file + rename).
+- On Linux the directory is `0700` and every file `0600` (only you can read them). On Windows,
+  `%APPDATA%` is private to your user account by default. Writes are atomic (temp file + rename).
 - Set `PGP_MESSENGER_HOME=/some/path` to use a different location, for example a throwaway test keyring.
 - The private key is **never stored unencrypted**. Your passphrase is asked for each time it's needed and is never saved.
 - These are standard armored OpenPGP files, so `gpg --import ~/.config/pgp-messenger/private_key.asc` works too.
+
+### Moving your key to another computer (e.g. Linux → Windows)
+
+1. On the old computer: **My Key → Back up private key…** and save the file somewhere you can carry it,
+   like a USB stick. The file stays locked with your passphrase, but treat it as sensitive anyway.
+2. On the new computer: run the app once so it creates its folder, then close it.
+3. Copy the backup into that folder (see the table above) and name it exactly `private_key.asc`.
+4. Start the app. **My Key** shows your key with the same fingerprint. Use your existing passphrase.
+
+Contacts don't move automatically. Copy `contacts.json` and the `contacts` folder across the same
+way, or just re-add people's public keys.
 
 ## How hybrid encryption works under the hood
 
@@ -126,7 +180,8 @@ OpenPGP combines the two:
 
 ## Limitations (v1)
 
-- No importing an existing private key from GnuPG yet (exporting/backing up works).
+- No *Import private key* button yet. Exporting/backing up works, and you can move a key by copying
+  the file (see *Moving your key to another computer*).
 - No key expiry, revocation certificates, or web-of-trust/keyserver lookups. Verify fingerprints by hand.
   PGPy itself doesn't check whether an imported key has been revoked.
 - PGPy's parser drops the signature from cleartext-signed messages containing non-ASCII text
@@ -145,4 +200,5 @@ pgp_messenger/
 ├── gui.py       PySide6 window and the five tabs
 └── __main__.py  `python -m pgp_messenger`
 tests/test_core.py   round-trip tests (no GUI)
+.github/workflows/tests.yml   CI: runs the tests on Linux + Windows, Python 3.11 and 3.14
 ```

@@ -1,13 +1,19 @@
 """Local key storage.
 
-Layout (default root: $XDG_CONFIG_HOME/pgp-messenger, i.e. ~/.config/pgp-messenger):
+Default root:
+    Linux/macOS: $XDG_CONFIG_HOME/pgp-messenger, i.e. ~/.config/pgp-messenger
+    Windows:     %APPDATA%\\pgp-messenger, i.e. C:\\Users\\<you>\\AppData\\Roaming\\pgp-messenger
+
+Layout:
 
     private_key.asc          your keypair; secret parts are passphrase-encrypted
     contacts.json            {"contacts": {"Alice": "<FINGERPRINT>", ...}}
     contacts/<FPR>.asc       one public key per contact
 
 Override the location with the PGP_MESSENGER_HOME environment variable.
-The directory is created 0700 and every file 0600.
+On Linux/macOS the directory is created 0700 and every file 0600. Windows
+ignores those mode bits; there, %APPDATA% is already private to your user
+account.
 """
 
 from __future__ import annotations
@@ -24,19 +30,25 @@ APP_DIR_NAME = "pgp-messenger"
 MAX_NAME_LEN = 64
 
 
-def default_root() -> Path:
+def default_root(os_name: str = os.name) -> Path:
     override = os.environ.get("PGP_MESSENGER_HOME")
     if override:
         return Path(override).expanduser()
-    base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    if os_name == "nt":
+        base = os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming"
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
     return Path(base) / APP_DIR_NAME
 
 
 def _atomic_write(path: Path, data: str) -> None:
-    """Write via temp file + rename so a crash never leaves a half-written key."""
+    """Write via temp file + rename so a crash never leaves a half-written key.
+
+    mkstemp creates the file 0600 (owner-only) on POSIX, and os.replace keeps
+    that mode. No os.fchmod needed, which Windows Python lacked before 3.13.
+    """
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
     try:
-        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(data)
             fh.flush()
