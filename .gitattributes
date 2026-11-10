@@ -1,0 +1,4 @@
+# Windows batch files must keep CRLF line endings; shell scripts must keep LF,
+# whatever the cloning machine's git settings are.
+*.bat text eol=crlf
+*.sh  text eol=lf

@@ -22,7 +22,50 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update -q && sudo apt-get install -yq libegl1 libxkbcommon0 libgl1
 
-      # Same steps the README tells users to run.
+      # Fresh checkout: the double-click launchers' first run creates .venv and
+      # installs everything; the second run must skip setup.
+      - name: Launcher setup (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ./run.sh --setup-only
+          ./run.sh --setup-only | tee second-run.log
+          ! grep -q "Setting up" second-run.log
+
+      - name: Launcher setup (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call run.bat --setup-only
+          if errorlevel 1 exit /b 1
+          call run.bat --setup-only > second-run.log
+          if errorlevel 1 exit /b 1
+          type second-run.log
+          findstr /c:"Setting up" second-run.log && exit /b 1
+          exit /b 0
+
+      - name: Launcher starts the app (Linux)
+        if: runner.os == 'Linux'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          code=0
+          timeout 15 ./run.sh || code=$?
+          test "$code" -eq 124   # still running after 15 s = it started
+
+      - name: Launcher starts the app (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          cmd /c run.bat
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Start-Sleep -Seconds 10
+          $app = Get-Process pythonw -ErrorAction SilentlyContinue
+          if (-not $app) { Write-Error "the app is not running"; exit 1 }
+          $app | Stop-Process -Force
+
+      # Same steps the README tells users to run (reuses the launcher's .venv).
       - name: Install
         run: |
           python -m venv .venv

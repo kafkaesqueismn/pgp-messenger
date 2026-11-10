@@ -22,10 +22,45 @@ It covers the common tasks and skips the rest.
 | **Files** | Encrypt any file (image, PDF, archive…) for a contact. The output is a signed, binary `.pgp` file saved next to the original or wherever you choose. Decrypt a `.pgp` file to restore the original, with the sender's signature checked. Asks before anything over 100 MB, shows a working indicator, and never overwrites a file without asking. |
 | **Sign & Verify** | Make a cleartext-signed message (still readable, but tamper-evident), or verify one somebody sent you. |
 
-## Install
+## Quick start: double-click to run
 
 Works on **Linux** and **Windows** with Python 3.11 or newer. The test suite runs on both
 (see the badge above).
+
+The folder contains two launchers that do all the setup for you:
+
+| | Launcher | What you need first |
+|---|---|---|
+| **Windows** | double-click **`run.bat`** | Python from [python.org](https://www.python.org/downloads/windows/), with **"Add python.exe to PATH"** ticked in the installer |
+| **Linux** | double-click **`run.sh`**, or run `./run.sh` in a terminal | Python 3.11+ (Arch: `sudo pacman -S python`; optionally `pyside6` for a much faster first run) |
+
+1. Get the code: `git clone https://github.com/kafkaesqueismn/pgp-messenger`, or on GitHub click
+   *Code → Download ZIP* and unzip it.
+2. Double-click the launcher for your system.
+
+- **First run:** a window shows the setup. The launcher creates a private Python environment in the
+  `.venv` folder and downloads the dependencies (a few minutes, needs internet). Then the app opens.
+- **Every run after that:** the app opens straight away. On Windows the black console window closes
+  by itself.
+- **After updating the code** (e.g. `git pull`): if `requirements.txt` changed, the launcher notices
+  and reinstalls automatically. An interrupted first run also picks up where it left off.
+- **Something broken?** Delete the `.venv` folder and run the launcher again to rebuild it.
+- `run.sh --setup-only` / `run.bat --setup-only` installs everything without starting the app.
+
+Platform notes:
+- **Windows** may warn about a file downloaded from the internet. Choose *Run* (or *More info → Run
+  anyway*). For a desktop icon, right-click `run.bat` → *Send to* → *Desktop (create shortcut)*.
+- **Linux file managers** differ on double-clicking scripts. Dolphin (KDE) and Thunar (Xfce) ask
+  whether to *Execute* it. GNOME Files opens scripts in a text editor, so right-click → *Run as a
+  Program* instead. If the first-run setup is needed, `run.sh` opens a terminal window so you can
+  watch it. If the file isn't executable (e.g. some ZIP tools drop the permission), run
+  `chmod +x run.sh` once.
+- On Arch, if `pyside6` is installed from pacman, `run.sh` reuses it instead of downloading Qt
+  (the same as Option A below). The first run then takes seconds, not minutes.
+
+## Manual install
+
+Prefer to set things up yourself? These are the same steps the launchers perform.
 
 ### Linux (Arch)
 
@@ -80,7 +115,10 @@ Everything comes from pip, including Qt, so there's nothing else to install. Gnu
 
 ## Run
 
-From the `pgp-messenger` folder, activate the venv, then start the app:
+The easiest way is the launcher: double-click `run.bat` (Windows) or `run.sh` (Linux), as
+described in [Quick start](#quick-start-double-click-to-run).
+
+After a manual install, activate the venv from the `pgp-messenger` folder, then start the app:
 
 ```bash
 source .venv/bin/activate          # Linux
@@ -247,6 +285,7 @@ pgp_messenger/
 ├── fileops.py   output file names and safe, no-overwrite writing for the Files tab
 ├── gui.py       PySide6 window and the six tabs
 └── __main__.py  `python -m pgp_messenger`
+run.bat / run.sh      double-click launchers: create .venv + install on first run, then start the app
 tests/test_core.py    keys, messages, signatures, keyring (no GUI)
 tests/test_files.py   file encryption, size limits, filename safety, no-overwrite writes, GnuPG interop
 tests/test_gui.py     Files tab, offscreen: large-file warning, working state, overwrite and bad-signature prompts
