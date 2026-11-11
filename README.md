@@ -1,6 +1,6 @@
 # PGP Messenger
 
-[![tests](https://github.com/kafkaesqueismn/pgp-messenger/actions/workflows/tests.yml/badge.svg)](https://github.com/kafkaesqueismn/pgp-messenger/actions/workflows/tests.yml)
+[![tests](https://github.com/kafkaesqueismn/pgp-messenger/actions/workflows/tests.yml/badge.svg)](https://github.com/kafkaesqueismn/pgp-messenger/actions/workflows/tests.yml) [![license: MIT](https://img.shields.io/badge/license-MIT-8b6fe0.svg)](LICENSE)
 
 A small, friendly desktop app for **encrypting, decrypting, signing and verifying text messages and
 files** with OpenPGP. It works with GnuPG, Thunderbird, Kleopatra, ProtonMail and other OpenPGP tools.
@@ -291,3 +291,7 @@ tests/test_files.py   file encryption, size limits, filename safety, no-overwrit
 tests/test_gui.py     Files tab, offscreen: large-file warning, working state, overwrite and bad-signature prompts
 .github/workflows/tests.yml   CI: runs the tests on Linux + Windows, Python 3.11 and 3.14
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
